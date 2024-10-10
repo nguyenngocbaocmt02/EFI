@@ -154,16 +154,17 @@ def main():
     parser.add_argument('--info_name', type=str, required=False)
     parser.add_argument('--eval_dataset', type=str, default='truthful_qa', help='Dataset used for evaluating model')
     parser.add_argument('--train_dataset', type=str, default='truthful_qa', help='Dataset used for training')
-    parser.add_argument('--rho', type=float, default=1.0, help='rho_threshold')
     parser.add_argument('--loss_type', type=str, default="fpr_fnr", help="loss for probing")
     parser.add_argument('--bl', type=float, default=1.0, help="balancing term for loss")
     parser.add_argument('--instruction_prompt', default="default",type=str, required=False)
-    parser.add_argument('--clf_folder', default="./clf",type=str, required=False)
+    parser.add_argument('--save_folder', default="./clf",type=str, required=False)
     parser.add_argument('--clf_only', default=0,type=int)
     parser.add_argument('--layer_sweep', default=2,type=int)
     parser.add_argument('--exp_mode', type=str, default='test', help='val or test')
     parser.add_argument('--prompting', default=0,type=int)
     parser.add_argument('--lora_rank', default=4, type=int)
+    parser.add_argument('--alpha_bl', type=float, default=0.9, help='alpha for iti')
+    parser.add_argument('--recal', action='store_true', help='use iti to select intervened heads', default=False)
 
     parser.add_argument('--use_iti', action='store_true', help='use iti to select intervened heads', default=False)
     parser.add_argument('--activations_dataset', type=str, default="tqa_gen_end_q", help='feature bank for calculating std along direction')
@@ -286,7 +287,7 @@ def main():
         #     val_votes = []
         #     accs = []
         #     for head_idx in range(num_heads):
-        #         save_path_clf = f"{args.clf_folder}/{args.train_dataset}/seed_{args.seed}_fold_{fold}_{args.model_name}_dataset_{args.dataset_name}_loss_type_{args.loss_type}_bl_{args.bl}_layer_{layer_idx}_head_{head_idx}.pth"
+        #         save_path_clf = f"{args.save_folder}/{args.exp}_eff_save/{args.train_dataset}/seed_{args.seed}_fold_{fold}_{args.model_name}_dataset_{args.dataset_name}_loss_type_{args.loss_type}_bl_{args.bl}_layer_{layer_idx}_head_{head_idx}.pth"
             
         #         X_train = all_X_train[:,layer_idx,head_idx,:]
         #         X_val = all_X_val[:,layer_idx,head_idx,:]
@@ -396,7 +397,7 @@ def main():
                 continue
             
         
-            filename = f'{args.model_name}_train_{args.train_dataset}_seed_{args.seed}_rho_{args.rho}_fold_{fold}_lt_{args.loss_type}_bl_{args.bl}_layer_{target_layer}'
+            filename = f'{args.model_name}_train_{args.train_dataset}_seed_{args.seed}_fold_{fold}_lt_{args.loss_type}_alpha_bl_{args.alpha_bl}_lora_rank_{args.lora_rank}_layer_{target_layer}'
             
             if args.train_dataset == eval_dataset:
                 test_file = f'splits/{args.train_dataset}/fold_{fold}_{mode}_seed_{args.seed}.csv'
@@ -429,10 +430,10 @@ def main():
                 except:
                     pass
             
-            save_folder = f'{args.exp}_eff_save/{args.train_dataset}/{args.model_name}_seed_{args.seed}_rho_{args.rho}_fold_{fold}_loss_type_{args.loss_type}_bl_{args.bl}'
+            save_folder = f'{args.save_folder}/{args.exp}_eff_save/{args.train_dataset}/{args.model_name}_seed_{args.seed}_fold_{fold}_loss_type_{args.loss_type}_alpha_bl_{args.alpha_bl}'
             used_activations = [separated_head_wise_activations[i] for i in train_set_idxs]
             used_labels = [separated_labels[i] for i in train_set_idxs]
-            interventions = get_eff_interventions_dict(top_heads, used_activations, used_labels, save_folder, rho=args.rho, lora_rank=args.lora_rank)
+            interventions = get_eff_interventions_dict(top_heads, used_activations, used_labels, save_folder, lora_rank=args.lora_rank, alpha=args.alpha_bl, recal=args.recal)
             
 
             def lt_modulated_vector_add(head_output, layer_name, start_edit_location='lt'): 
@@ -499,6 +500,7 @@ def main():
                 print(curr_fold_results)
                 curr_fold_results = curr_fold_results.to_numpy()[0].astype(float)
                 break
+        break
 
 if __name__ == "__main__":
     main()

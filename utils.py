@@ -912,88 +912,145 @@ import torch.optim as optim
 import torch.nn as nn
 from tqdm import tqdm
 import time
-def get_eff_interventions_dict(top_heads, tuning_activations, tuning_labels, save_folder, rho=1.0, alpha=0, lora_rank=4, batch_size=100, val_rate=0.2, device="cuda"):
+import matplotlib.pyplot as plt
+def get_eff_interventions_dict(top_heads, tuning_activations, tuning_labels, save_folder, alpha=0.9, lora_rank=4, batch_size=100, val_rate=0.2, recal=False, device="cuda"):
     interventions = {}
     for head, layer in top_heads: 
         interventions[f"model.layers.{layer}.self_attn.o_proj"] = []
+    if not os.path.exists(save_folder):
+        os.makedirs(save_folder)
+        print(f"Created directory: {save_folder}")
 
     for head, layer in top_heads:
-        inputs = []
-        projs = []
-        for question_stt in tqdm(range(len(tuning_activations))):
-            labels = torch.tensor(tuning_labels[question_stt], dtype=torch.float32)
-            activations = torch.tensor(tuning_activations[question_stt][:, layer, head, :], dtype=torch.float32)
-            activations = activations.reshape((activations.shape[0], -1))
-            
-            des_activations = activations[labels == 1]
-            if len(des_activations) <= 1:
-                continue
-            inputs.append(activations)
-            mean_des = torch.mean(des_activations, dim=0, keepdim=True)
-            cov_des = torch.tensor(empirical_covariance(des_activations), dtype=torch.float32)
-            diag_indices = torch.arange(cov_des.shape[0])
-            diag_matrix = torch.zeros_like(cov_des)
-            diag_matrix[diag_indices, diag_indices] = cov_des.diag()
-            cov_des= cov_des * alpha + (1 - alpha) * diag_matrix
-            inv_cov_des = sqrtm(cov_des)
-            projf = lambda x: mean_des + (x - mean_des) * (rho ** 0.5) / (((x - mean_des) @ inv_cov_des @ (x - mean_des).T) ** 0.5)
-            projs.append(torch.concatenate([activations[[i]] if labels[i] == 1 else projf(activations[[i]]) for i in range(len(activations))], dim=0))
-        inputs = torch.concatenate(inputs, dim=0)
-        projs = torch.concatenate(projs, dim=0)
-        train_size = int((1 - val_rate) * inputs.shape[0])
-        train_inputs = inputs[:train_size]
-        train_projs = projs[:train_size]
-        val_inputs = inputs[train_size:]
-        val_projs = projs[train_size:]
+        inputs_file = os.path.join(save_folder, f"model.layers.{layer}.{head}.self_attn.o_proj_all_alpha_{alpha}.pt")
+        try:
+            save_info = torch.load(inputs_file)
+            inputs = save_info["input"]
+            mean_des_co = save_info["mean"]
+            inv_cov_des_co = save_info["inv_cov"]
+            rho_co = save_info["rho"]
+            if recal:
+                raise Exception("Recalibration required.")
+        except:
+            inputs = []
+            mean_des_co = []
+            inv_cov_des_co = []
+            rho_co = []
+            for question_stt in tqdm(range(len(tuning_activations))):
+                labels = torch.tensor(tuning_labels[question_stt], dtype=torch.float32)
+                activations = torch.tensor(tuning_activations[question_stt][:, layer, head, :], dtype=torch.float32)
+                activations = activations.reshape((activations.shape[0], -1))
+                des_activations = activations[labels == 1]
+                if len(des_activations) <= 1:
+                    continue
+                mean_des = torch.mean(des_activations, dim=0, keepdim=True)
+                cov_des = torch.tensor(empirical_covariance(des_activations), dtype=torch.float32)
+                diag_indices = torch.arange(cov_des.shape[0])
+                diag_matrix = torch.zeros_like(cov_des)
+                diag_matrix[diag_indices, diag_indices] = cov_des.diag()
+                cov_des= cov_des * alpha + (1 - alpha) * diag_matrix + 1e-12 * torch.eye(cov_des.shape[0])
+                inv_cov_des = torch.inverse(cov_des)
+                rhos = [((x - mean_des) @ inv_cov_des @ (x - mean_des).T).item() for x in des_activations]
+                rho = max(rhos)
+                inputs.append(activations)
+                mean_des_co.append(mean_des.repeat(len(activations), 1))
+                inv_cov_des_co.append(cov_des.unsqueeze(0).repeat(len(activations), 1, 1))
+                rho_co.append(torch.tensor(rho).unsqueeze(0).repeat(len(activations), 1))
+                
+            inputs = torch.concatenate(inputs, dim=0)
+            mean_des_co = torch.concatenate(mean_des_co, dim=0)
+            inv_cov_des_co = torch.concatenate(inv_cov_des_co, dim=0)
+            rho_co = torch.concatenate(rho_co, dim=0)
+            torch.save({"input" : inputs, "mean" : mean_des_co, "inv_cov" : inv_cov_des_co, "rho" : rho_co}, inputs_file)
+        intervention_path = os.path.join(save_folder, f"model.layers.{layer}.{head}.self_attn.o_proj_all_alpha_{alpha}_lora_rank_{lora_rank}.pt")
+        
+        try:
+            components = torch.load(intervention_path)
+            best_b = components["best_b"]
+            best_W = components["best_W"]
+            best_R = components["best_R"]
+            if recal:
+                raise Exception("Recalibration required.")
+        except:
+            train_size = int((1 - val_rate) * inputs.shape[0])
+            train_inputs = inputs[:train_size]
+            train_mean_des = mean_des_co[:train_size]
+            train_inv_cov_des = inv_cov_des_co[:train_size]
+            train_rho = rho_co[:train_size]
 
-        D = inputs.shape[1]
-        W = Parameter(torch.zeros(D, lora_rank, device=device))
-        init.kaiming_uniform_(W, a=math.sqrt(5))
-        b = Parameter(torch.zeros(D, lora_rank, device=device))
-        R = Parameter(torch.zeros(D, lora_rank, device=device))
-        init.kaiming_uniform_(R, a=math.sqrt(5))
-        optimizer = optim.Adam([W, b, R], lr=1e-3)
-        num_samples_train = train_inputs.shape[0]
-        num_samples_val = val_inputs.shape[0]
-        for epoch in range(1000):
-            perm = torch.randperm(num_samples_train)
-            train_inputs = train_inputs[perm]
-            train_projs = train_projs[perm]
-            train_loss = 0.0
-            cnt = 0
-            for i in range(0, num_samples_train, batch_size):
-                optimizer.zero_grad()
-                last_idx = min(i + batch_size, num_samples_train)
-                if last_idx == i:
-                    break
-                input_batch = train_inputs[i:last_idx].to(device)
-                proj_batch = train_projs[i:last_idx].to(device)
-                output = input_batch + (torch.tanh(W.unsqueeze(0).repeat(input_batch.shape[0], 1, 1) * input_batch.unsqueeze(-1).repeat(1, 1, lora_rank) + b) @ R.T @ input_batch.unsqueeze(-1)).squeeze()
-                loss = nn.functional.mse_loss(proj_batch, output)
-                loss.backward()
-                optimizer.step()
-                train_loss += loss.item()
-                cnt += 1
-            train_loss /= cnt
-            with torch.no_grad():
-                val_loss = 0.0
+            val_inputs = inputs[train_size:]
+            val_mean_des = mean_des_co[train_size:]
+            val_inv_cov_des = inv_cov_des_co[train_size:]
+            val_rho = rho_co[train_size:]
+
+            D = inputs.shape[1]
+            W = Parameter(torch.zeros(D, lora_rank, device=device))
+            init.kaiming_uniform_(W, a=math.sqrt(5))
+            b = Parameter(torch.zeros(D, lora_rank, device=device))
+            R = Parameter(torch.zeros(D, lora_rank, device=device))
+            init.kaiming_uniform_(R, a=math.sqrt(5))
+            optimizer = optim.Adam([W, b, R], lr=1e-3)
+            num_samples_train = train_inputs.shape[0]
+            num_samples_val = val_inputs.shape[0]
+            best_val_loss = float('inf')
+            best_W = None
+            best_b = None
+            best_R = None
+            for epoch in range(1000):
+                perm = torch.randperm(num_samples_train)
+                train_inputs = train_inputs[perm]
+                train_mean_des = train_mean_des[perm]
+                train_inv_cov_des = train_inv_cov_des[perm]
+                train_rho = train_rho[perm]
+
+                train_loss = 0.0
                 cnt = 0
-                for i in range(0, num_samples_val, batch_size):
-                    last_idx = min(i + batch_size, num_samples_val)
+                for i in range(0, num_samples_train, batch_size):
+                    optimizer.zero_grad()
+                    last_idx = min(i + batch_size, num_samples_train)
                     if last_idx == i:
                         break
-                    input_batch = val_inputs[i:last_idx].to(device)
-                    proj_batch = val_projs[i:last_idx].to(device)
+                    input_batch = train_inputs[i:last_idx].to(device)
+                    mean_des_batch = train_mean_des[i:last_idx].to(device)
+                    inv_cov_des_batch = train_inv_cov_des[i:last_idx].to(device)
+                    rho_batch = train_rho[i:last_idx].to(device)
                     output = input_batch + (torch.tanh(W.unsqueeze(0).repeat(input_batch.shape[0], 1, 1) * input_batch.unsqueeze(-1).repeat(1, 1, lora_rank) + b) @ R.T @ input_batch.unsqueeze(-1)).squeeze()
-                    val_loss += nn.functional.mse_loss(proj_batch, output).item()
+                    diff = (output - mean_des_batch).unsqueeze(-1)
+                    loss = torch.mean((torch.max((torch.matmul(torch.matmul(diff.transpose(1, 2), inv_cov_des_batch), diff).squeeze()) ** 0.5 - rho_batch.squeeze() ** 0.5, torch.tensor(0))) ** 2)
+                    loss.backward()
+                    optimizer.step()
+                    train_loss += loss.item()
                     cnt += 1
-                val_loss /= cnt
-            if epoch % 100 == 0:
-                print(f'Epoch {epoch}, Avg Training Loss: {train_loss}, Avg Validation Loss: {val_loss}')
-        W.requires_grad = False
-        b.requires_grad = False
-        R.requires_grad = False
-        interventions[f"model.layers.{layer}.self_attn.o_proj"].append((head, W, b, R))
+                train_loss /= cnt
+                with torch.no_grad():
+                    val_loss = 0.0
+                    cnt = 0
+                    rate = 0.0
+                    for i in range(0, num_samples_val, batch_size):
+                        last_idx = min(i + batch_size, num_samples_val)
+                        if last_idx == i:
+                            break
+                        input_batch = val_inputs[i:last_idx].to(device)
+                        mean_des_batch = val_mean_des[i:last_idx].to(device)
+                        inv_cov_des_batch = val_inv_cov_des[i:last_idx].to(device)
+                        rho_batch = val_rho[i:last_idx].to(device)
+                        output = input_batch + (torch.tanh(W.unsqueeze(0).repeat(input_batch.shape[0], 1, 1) * input_batch.unsqueeze(-1).repeat(1, 1, lora_rank) + b) @ R.T @ input_batch.unsqueeze(-1)).squeeze()
+                        diff = (output - mean_des_batch).unsqueeze(-1)
+                        val_loss += torch.mean((torch.max((torch.matmul(torch.matmul(diff.transpose(1, 2), inv_cov_des_batch), diff).squeeze()) ** 0.5 - rho_batch.squeeze() ** 0.5, torch.tensor(0))) ** 2).item()
+                        cnt += 1
+                    val_loss /= cnt
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        best_W = W.clone().detach()
+                        best_b = b.clone().detach()
+                        best_R = R.clone().detach()
+                    if epoch % 50 == 0:
+                        print(f'Epoch {epoch}, Avg Training Loss: {train_loss}, Avg Validation Loss: {val_loss}')
+            best_W.requires_grad = False
+            best_b.requires_grad = False
+            best_R.requires_grad = False
+            torch.save({"best_W" : best_W, "best_b" : best_b, "best_R" : best_R}, intervention_path)
+        interventions[f"model.layers.{layer}.self_attn.o_proj"].append((head, best_W, best_b, best_R))
         
     for layer, head in top_heads: 
         interventions[f"model.layers.{layer}.self_attn.o_proj"] = sorted(interventions[f"model.layers.{layer}.self_attn.o_proj"], key = lambda x: x[0])
