@@ -787,6 +787,7 @@ def get_separated_activations(labels, head_wise_activations):
     assert separated_labels == actual_labels
 
     separated_head_wise_activations = np.split(head_wise_activations, idxs_to_split_at)
+
     return separated_head_wise_activations, separated_labels, idxs_to_split_at
 
 def get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels): 
@@ -913,22 +914,28 @@ import torch.nn as nn
 from tqdm import tqdm
 import time
 import matplotlib.pyplot as plt
-def get_eff_interventions_dict(top_heads, tuning_activations, tuning_labels, save_folder, alpha=0.9, lora_rank=4, batch_size=100, val_rate=0.2, recal=False, device="cuda"):
+def get_elipsoid_interventions_dict(top_heads, tuning_activations, tuning_labels, val_activations, val_labels, save_folder, alpha=0.9, lora_rank=4, batch_size=100, recal=False, device="cuda", delta=1.0, ):
     interventions = {}
-    for head, layer in top_heads: 
+    for layer, head in top_heads: 
         interventions[f"model.layers.{layer}.self_attn.o_proj"] = []
     if not os.path.exists(save_folder):
         os.makedirs(save_folder)
         print(f"Created directory: {save_folder}")
 
-    for head, layer in top_heads:
-        inputs_file = os.path.join(save_folder, f"model.layers.{layer}.{head}.self_attn.o_proj_all_alpha_{alpha}.pt")
+    for layer, head in top_heads:
+        inputs_file = os.path.join(save_folder, f"model.layers.{layer}.{head}.self_attn.o_proj_all_alpha_{alpha}_delta_{delta}_train.pt")
+        val_file = os.path.join(save_folder, f"model.layers.{layer}.{head}.self_attn.o_proj_all_alpha_{alpha}_delta_{delta}_val.pt")
         try:
             save_info = torch.load(inputs_file)
             inputs = save_info["input"]
             mean_des_co = save_info["mean"]
             inv_cov_des_co = save_info["inv_cov"]
             rho_co = save_info["rho"]
+            save_info = torch.load(val_file)
+            inputs_val = save_info["input"]
+            mean_des_co_val = save_info["mean"]
+            inv_cov_des_co_val = save_info["inv_cov"]
+            rho_co_val = save_info["rho"]
             if recal:
                 raise Exception("Recalibration required.")
         except:
@@ -936,6 +943,28 @@ def get_eff_interventions_dict(top_heads, tuning_activations, tuning_labels, sav
             mean_des_co = []
             inv_cov_des_co = []
             rho_co = []
+            inputs_val = []
+            mean_des_co_val = []
+            inv_cov_des_co_val = []
+            rho_co_val = []
+            # all_des_acts = []
+            # all_un_acts = []
+            cov_des_list = []
+            cnt = 0
+            for question_stt in range(len(tuning_activations)):
+                labels = torch.tensor(tuning_labels[question_stt], dtype=torch.float32)
+                des_activations = torch.tensor(tuning_activations[question_stt][:, layer, head, :], dtype=torch.float32)[labels == 1]
+                # un_activations = torch.tensor(tuning_activations[question_stt][:, layer, head, :], dtype=torch.float32)[labels == 0]
+                # all_des_acts.append(des_activations)
+                # all_un_acts.append(un_activations)
+                cov_des_list.append(torch.tensor(empirical_covariance(des_activations), dtype=torch.float32) * len(des_activations))
+                cnt += len(des_activations)
+            cov_des_lda = 0
+            for i in range(len(cov_des_list)):
+                cov_des_lda += cov_des_list[i]
+            cov_des_lda /= cnt
+            #cov_des = torch.tensor(empirical_covariance(torch.concatenate(all_des_acts, dim=0)), dtype=torch.float32)
+            #inv_cov_des = torch.inverse(cov_des)
             for question_stt in tqdm(range(len(tuning_activations))):
                 labels = torch.tensor(tuning_labels[question_stt], dtype=torch.float32)
                 activations = torch.tensor(tuning_activations[question_stt][:, layer, head, :], dtype=torch.float32)
@@ -943,26 +972,53 @@ def get_eff_interventions_dict(top_heads, tuning_activations, tuning_labels, sav
                 des_activations = activations[labels == 1]
                 if len(des_activations) <= 1:
                     continue
-                mean_des = torch.mean(des_activations, dim=0, keepdim=True)
-                cov_des = torch.tensor(empirical_covariance(des_activations), dtype=torch.float32)
-                diag_indices = torch.arange(cov_des.shape[0])
-                diag_matrix = torch.zeros_like(cov_des)
-                diag_matrix[diag_indices, diag_indices] = cov_des.diag()
-                cov_des= cov_des * alpha + (1 - alpha) * diag_matrix + 1e-12 * torch.eye(cov_des.shape[0])
+                mean_des_tmp = torch.mean(des_activations, dim=0, keepdim=True)
+                mean_und = torch.mean(activations[labels == 0], dim=0, keepdim=True)
+                mean_des = mean_und + (mean_des_tmp - mean_und) * delta
+                # cov_des = torch.tensor(empirical_covariance(des_activations), dtype=torch.float32)
+                # diag_indices = torch.arange(cov_des.shape[0])
+                # diag_matrix = torch.zeros_like(cov_des)
+                # diag_matrix[diag_indices, diag_indices] = cov_des.diag()
+                # cov_des= cov_des * alpha + (1 - alpha) * diag_matrix + 1e-12 * torch.eye(cov_des.shape[0])
+                # inv_cov_des = torch.inverse(cov_des)
+                cov_des = cov_des_lda * (1.0 - alpha) + alpha * torch.tensor(empirical_covariance(des_activations), dtype=torch.float32)
                 inv_cov_des = torch.inverse(cov_des)
-                rhos = [((x - mean_des) @ inv_cov_des @ (x - mean_des).T).item() for x in des_activations]
+                rhos = [((x - mean_des_tmp) @ inv_cov_des @ (x - mean_des_tmp).T).item() for x in des_activations]
                 rho = max(rhos)
                 inputs.append(activations)
                 mean_des_co.append(mean_des.repeat(len(activations), 1))
-                inv_cov_des_co.append(cov_des.unsqueeze(0).repeat(len(activations), 1, 1))
+                inv_cov_des_co.append(inv_cov_des.unsqueeze(0).repeat(len(activations), 1, 1))
                 rho_co.append(torch.tensor(rho).unsqueeze(0).repeat(len(activations), 1))
+            for question_stt in tqdm(range(len(val_activations))):
+                labels = torch.tensor(val_labels[question_stt], dtype=torch.float32)
+                activations = torch.tensor(val_activations[question_stt][:, layer, head, :], dtype=torch.float32)
+                activations = activations.reshape((activations.shape[0], -1))
+                des_activations = activations[labels == 1]
+                if len(des_activations) <= 1:
+                    continue
+                mean_des_tmp = torch.mean(des_activations, dim=0, keepdim=True)
+                mean_und = torch.mean(activations[labels == 0], dim=0, keepdim=True)
+                mean_des = mean_und + (mean_des_tmp - mean_und) * delta
+                cov_des = cov_des_lda * (1.0 - alpha) + alpha * torch.tensor(empirical_covariance(des_activations), dtype=torch.float32)
+                inv_cov_des = torch.inverse(cov_des)
+                rhos = [((x - mean_des_tmp) @ inv_cov_des @ (x - mean_des_tmp).T).item() for x in des_activations]
+                rho = max(rhos)
+                inputs_val.append(activations)
+                mean_des_co_val.append(mean_des.repeat(len(activations), 1))
+                inv_cov_des_co_val.append(inv_cov_des.unsqueeze(0).repeat(len(activations), 1, 1))
+                rho_co_val.append(torch.tensor(rho).unsqueeze(0).repeat(len(activations), 1))
                 
             inputs = torch.concatenate(inputs, dim=0)
             mean_des_co = torch.concatenate(mean_des_co, dim=0)
             inv_cov_des_co = torch.concatenate(inv_cov_des_co, dim=0)
             rho_co = torch.concatenate(rho_co, dim=0)
+            inputs_val = torch.concatenate(inputs_val, dim=0)
+            mean_des_co_val = torch.concatenate(mean_des_co_val, dim=0)
+            inv_cov_des_co_val = torch.concatenate(inv_cov_des_co_val, dim=0)
+            rho_co_val = torch.concatenate(rho_co_val, dim=0)
             torch.save({"input" : inputs, "mean" : mean_des_co, "inv_cov" : inv_cov_des_co, "rho" : rho_co}, inputs_file)
-        intervention_path = os.path.join(save_folder, f"model.layers.{layer}.{head}.self_attn.o_proj_all_alpha_{alpha}_lora_rank_{lora_rank}.pt")
+            torch.save({"input" : inputs_val, "mean" : mean_des_co_val, "inv_cov" : inv_cov_des_co_val, "rho" : rho_co_val}, val_file)
+        intervention_path = os.path.join(save_folder, f"model.layers.{layer}.{head}.self_attn.o_proj_all_alpha_{alpha}_lora_rank_{lora_rank}_delta_{delta}.pt")
         
         try:
             components = torch.load(intervention_path)
@@ -972,16 +1028,15 @@ def get_eff_interventions_dict(top_heads, tuning_activations, tuning_labels, sav
             if recal:
                 raise Exception("Recalibration required.")
         except:
-            train_size = int((1 - val_rate) * inputs.shape[0])
-            train_inputs = inputs[:train_size]
-            train_mean_des = mean_des_co[:train_size]
-            train_inv_cov_des = inv_cov_des_co[:train_size]
-            train_rho = rho_co[:train_size]
+            train_inputs = inputs
+            train_mean_des = mean_des_co
+            train_inv_cov_des = inv_cov_des_co
+            train_rho = rho_co
 
-            val_inputs = inputs[train_size:]
-            val_mean_des = mean_des_co[train_size:]
-            val_inv_cov_des = inv_cov_des_co[train_size:]
-            val_rho = rho_co[train_size:]
+            val_inputs = inputs_val
+            val_mean_des = mean_des_co_val
+            val_inv_cov_des = inv_cov_des_co_val
+            val_rho = rho_co_val
 
             D = inputs.shape[1]
             W = Parameter(torch.zeros(D, lora_rank, device=device))
@@ -989,7 +1044,7 @@ def get_eff_interventions_dict(top_heads, tuning_activations, tuning_labels, sav
             b = Parameter(torch.zeros(D, lora_rank, device=device))
             R = Parameter(torch.zeros(D, lora_rank, device=device))
             init.kaiming_uniform_(R, a=math.sqrt(5))
-            optimizer = optim.Adam([W, b, R], lr=1e-3)
+            optimizer = optim.Adam([W, b, R], lr=2e-4)
             num_samples_train = train_inputs.shape[0]
             num_samples_val = val_inputs.shape[0]
             best_val_loss = float('inf')
@@ -1016,7 +1071,8 @@ def get_eff_interventions_dict(top_heads, tuning_activations, tuning_labels, sav
                     rho_batch = train_rho[i:last_idx].to(device)
                     output = input_batch + (torch.tanh(W.unsqueeze(0).repeat(input_batch.shape[0], 1, 1) * input_batch.unsqueeze(-1).repeat(1, 1, lora_rank) + b) @ R.T @ input_batch.unsqueeze(-1)).squeeze()
                     diff = (output - mean_des_batch).unsqueeze(-1)
-                    loss = torch.mean((torch.max((torch.matmul(torch.matmul(diff.transpose(1, 2), inv_cov_des_batch), diff).squeeze()) ** 0.5 - rho_batch.squeeze() ** 0.5, torch.tensor(0))) ** 2)
+                    loss = torch.mean((torch.max((torch.matmul(torch.matmul(diff.transpose(1, 2), inv_cov_des_batch), diff).squeeze()) ** 0.5 - rho_batch.squeeze() ** 0.5, torch.tensor(0.0))) ** 2)
+                    #loss = torch.sum(((torch.tensor(1.0) - rho_batch.squeeze() ** 0.5 / (torch.matmul(torch.matmul(diff.transpose(1, 2), inv_cov_des_batch), diff).squeeze()) ** 0.5).unsqueeze(-1).repeat(1, D) * diff.squeeze()) ** 2) / len(input_batch)
                     loss.backward()
                     optimizer.step()
                     train_loss += loss.item()
@@ -1037,6 +1093,7 @@ def get_eff_interventions_dict(top_heads, tuning_activations, tuning_labels, sav
                         output = input_batch + (torch.tanh(W.unsqueeze(0).repeat(input_batch.shape[0], 1, 1) * input_batch.unsqueeze(-1).repeat(1, 1, lora_rank) + b) @ R.T @ input_batch.unsqueeze(-1)).squeeze()
                         diff = (output - mean_des_batch).unsqueeze(-1)
                         val_loss += torch.mean((torch.max((torch.matmul(torch.matmul(diff.transpose(1, 2), inv_cov_des_batch), diff).squeeze()) ** 0.5 - rho_batch.squeeze() ** 0.5, torch.tensor(0))) ** 2).item()
+                        #val_loss += torch.sum(((torch.tensor(1.0) - rho_batch.squeeze() ** 0.5 / (torch.matmul(torch.matmul(diff.transpose(1, 2), inv_cov_des_batch), diff).squeeze()) ** 0.5).unsqueeze(-1).repeat(1, D) * diff.squeeze()) ** 2) / len(input_batch)
                         cnt += 1
                     val_loss /= cnt
                     if val_loss < best_val_loss:
@@ -1055,7 +1112,143 @@ def get_eff_interventions_dict(top_heads, tuning_activations, tuning_labels, sav
     for layer, head in top_heads: 
         interventions[f"model.layers.{layer}.self_attn.o_proj"] = sorted(interventions[f"model.layers.{layer}.self_attn.o_proj"], key = lambda x: x[0])
     return interventions
-            
+
+
+def get_linear_span_interventions_dict(top_heads, tuning_activations, tuning_labels, val_activations, val_labels, save_folder, kappa=0.01, lora_rank=4, batch_size=100, recal=False, device="cuda"):
+    interventions = {}
+    for layer, head in top_heads: 
+        interventions[f"model.layers.{layer}.self_attn.o_proj"] = []
+    if not os.path.exists(save_folder):
+        os.makedirs(save_folder)
+        print(f"Created directory: {save_folder}")
+
+    for layer, head in top_heads:
+        inputs_file = os.path.join(save_folder, f"model.layers.{layer}.{head}.self_attn.o_proj_all_kappa_{kappa}_train.pt")
+        val_file = os.path.join(save_folder, f"model.layers.{layer}.{head}.self_attn.o_proj_all_kappa_{kappa}_val.pt")
+        try:
+            save_info = torch.load(inputs_file)
+            inputs = save_info["input"]
+            Hq = save_info["H"]
+            save_info = torch.load(val_file)
+            inputs_val = save_info["input"]
+            Hq_val = save_info["H"]
+            if recal:
+                raise Exception("Recalibration required.")
+        except:
+            inputs = []
+            Hq = []
+            inputs_val = []
+            Hq_val = []
+        
+            for question_stt in tqdm(range(len(tuning_activations))):
+                labels = torch.tensor(tuning_labels[question_stt], dtype=torch.float32)
+                activations = torch.tensor(tuning_activations[question_stt][:, layer, head, :], dtype=torch.float32)
+                activations = activations.reshape((activations.shape[0], -1))
+                des_activations = activations[labels == 1]
+                tmp_H = des_activations @ des_activations.T
+                tmp_H = tmp_H + torch.eye(tmp_H.shape[-1]) * kappa
+                final_H = des_activations.T @ torch.inverse(tmp_H) @ des_activations
+                inputs.append(activations)
+                Hq.append(final_H.unsqueeze(0).repeat(len(activations), 1, 1))
+            for question_stt in tqdm(range(len(val_activations))):
+                labels = torch.tensor(val_labels[question_stt], dtype=torch.float32)
+                activations = torch.tensor(val_activations[question_stt][:, layer, head, :], dtype=torch.float32)
+                activations = activations.reshape((activations.shape[0], -1))
+                des_activations = activations[labels == 1]
+                tmp_H = des_activations @ des_activations.T
+                tmp_H = tmp_H + torch.eye(tmp_H.shape[-1]) * kappa
+                final_H = des_activations.T @ torch.inverse(tmp_H) @ des_activations
+                inputs_val.append(activations)
+                Hq_val.append(final_H.unsqueeze(0).repeat(len(activations), 1, 1))
+                
+            inputs = torch.concatenate(inputs, dim=0)
+            Hq = torch.concatenate(Hq, dim=0)
+            inputs_val = torch.concatenate(inputs_val, dim=0)
+            Hq_val = torch.concatenate(Hq_val, dim=0)
+            torch.save({"input" : inputs, "H" : Hq}, inputs_file)
+            torch.save({"input" : inputs_val, "H" : Hq_val}, val_file)
+        intervention_path = os.path.join(save_folder, f"model.layers.{layer}.{head}.self_attn.o_proj_all_kappa_{kappa}_lora_rank_{lora_rank}.pt")
+        
+        try:
+            components = torch.load(intervention_path)
+            best_b = components["best_b"]
+            best_W = components["best_W"]
+            best_R = components["best_R"]
+            if recal:
+                raise Exception("Recalibration required.")
+        except:
+            train_inputs = inputs
+            train_Hq = Hq
+
+            val_inputs = inputs_val
+            val_Hq = Hq_val
+
+            D = inputs.shape[1]
+            W = Parameter(torch.zeros(D, lora_rank, device=device))
+            init.kaiming_uniform_(W, a=math.sqrt(5))
+            b = Parameter(torch.zeros(D, lora_rank, device=device))
+            R = Parameter(torch.zeros(D, lora_rank, device=device))
+            init.kaiming_uniform_(R, a=math.sqrt(5))
+            optimizer = optim.Adam([W, b, R], lr=2e-4)
+            num_samples_train = train_inputs.shape[0]
+            num_samples_val = val_inputs.shape[0]
+            best_val_loss = float('inf')
+            best_W = None
+            best_b = None
+            best_R = None
+            for epoch in range(1000):
+                perm = torch.randperm(num_samples_train)
+                train_inputs = train_inputs[perm]
+                train_Hq = train_Hq[perm]
+
+                train_loss = 0.0
+                cnt = 0
+                for i in range(0, num_samples_train, batch_size):
+                    optimizer.zero_grad()
+                    last_idx = min(i + batch_size, num_samples_train)
+                    if last_idx == i:
+                        break
+                    input_batch = train_inputs[i:last_idx].to(device)
+                    Hq_batch = train_Hq[i:last_idx].to(device)
+                    output = input_batch + (torch.tanh(W.unsqueeze(0).repeat(input_batch.shape[0], 1, 1) * input_batch.unsqueeze(-1).repeat(1, 1, lora_rank) + b) @ R.T @ input_batch.unsqueeze(-1)).squeeze()
+                    loss = torch.sum((output.squeeze() - torch.matmul(Hq_batch, output.unsqueeze(-1)).squeeze()) ** 2)
+                    loss.backward()
+                    optimizer.step()
+                    train_loss += loss.item()
+                    cnt += input_batch.shape[0]
+                train_loss /= cnt
+                with torch.no_grad():
+                    val_loss = 0.0
+                    cnt = 0
+                    for i in range(0, num_samples_val, batch_size):
+                        last_idx = min(i + batch_size, num_samples_val)
+                        if last_idx == i:
+                            break
+                        input_batch = val_inputs[i:last_idx].to(device)
+                        Hq_batch = val_Hq[i:last_idx].to(device)
+                        output = input_batch + (torch.tanh(W.unsqueeze(0).repeat(input_batch.shape[0], 1, 1) * input_batch.unsqueeze(-1).repeat(1, 1, lora_rank) + b) @ R.T @ input_batch.unsqueeze(-1)).squeeze()
+                        loss = torch.sum((output.squeeze() - torch.matmul(Hq_batch, output.unsqueeze(-1)).squeeze()) ** 2)
+                        val_loss += loss.item()
+                        cnt += input_batch.shape[0]
+                    val_loss /= cnt
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        best_W = W.clone().detach()
+                        best_b = b.clone().detach()
+                        best_R = R.clone().detach()
+                    if epoch % 50 == 0:
+                        print(f'Epoch {epoch}, Avg Training Loss: {train_loss}, Avg Validation Loss: {val_loss}')
+            best_W.requires_grad = False
+            best_b.requires_grad = False
+            best_R.requires_grad = False
+            torch.save({"best_W" : best_W, "best_b" : best_b, "best_R" : best_R}, intervention_path)
+        interventions[f"model.layers.{layer}.self_attn.o_proj"].append((head, best_W, best_b, best_R))
+        
+    for layer, head in top_heads: 
+        interventions[f"model.layers.{layer}.self_attn.o_proj"] = sorted(interventions[f"model.layers.{layer}.self_attn.o_proj"], key = lambda x: x[0])
+    return interventions
+
+  
 
 
 

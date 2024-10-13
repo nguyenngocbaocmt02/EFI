@@ -21,7 +21,7 @@ import sys
 from torch.nn.functional import tanh
 sys.path.append('../')
 from lofit_models.modeling_llama import LlamaModel,LlamaForCausalLM
-from utils import alt_tqa_evaluate, format_truthfulqa, flattened_idx_to_layer_head, layer_head_to_flattened_idx, get_interventions_dict, get_ot_interventions_dict, get_top_heads, get_separated_activations, get_com_directions, get_eff_interventions_dict
+from utils import alt_tqa_evaluate, format_truthfulqa, flattened_idx_to_layer_head, layer_head_to_flattened_idx, get_interventions_dict, get_ot_interventions_dict, get_top_heads, get_separated_activations, get_com_directions, get_linear_span_interventions_dict
 import llama
 HF_NAMES = {
     # Base models
@@ -163,7 +163,7 @@ def main():
     parser.add_argument('--exp_mode', type=str, default='test', help='val or test')
     parser.add_argument('--prompting', default=0,type=int)
     parser.add_argument('--lora_rank', default=4, type=int)
-    parser.add_argument('--alpha_bl', type=float, default=0.9, help='alpha for iti')
+    parser.add_argument('--kappa', type=float, default=0.01, help='alpha for iti')
     parser.add_argument('--recal', action='store_true', help='use iti to select intervened heads', default=False)
 
     parser.add_argument('--use_iti', action='store_true', help='use iti to select intervened heads', default=False)
@@ -397,7 +397,7 @@ def main():
                 continue
             
         
-            filename = f'{args.model_name}_train_{args.train_dataset}_seed_{args.seed}_fold_{fold}_lt_{args.loss_type}_alpha_bl_{args.alpha_bl}_lora_rank_{args.lora_rank}_layer_{target_layer}'
+            filename = f'{args.model_name}_train_{args.train_dataset}_seed_{args.seed}_fold_{fold}_lt_{args.loss_type}_kappa_{args.kappa}_lora_rank_{args.lora_rank}_layer_{target_layer}'
             
             if args.train_dataset == eval_dataset:
                 test_file = f'splits/{args.train_dataset}/fold_{fold}_{mode}_seed_{args.seed}.csv'
@@ -415,8 +415,8 @@ def main():
                 filename = f'shot{args.prompting}_' + filename
 
 
-            output_path = f'results_dump/{eval_dataset}/{args.exp}_{args.instruction_prompt}_ours/answer_dump/{mode}/{filename}.csv'
-            summary_path = f'results_dump/{eval_dataset}/{args.exp}_{args.instruction_prompt}_ours/summary_dump/{mode}/{filename}.csv'
+            output_path = f'results_dump/{eval_dataset}/{args.exp}_{args.instruction_prompt}_subspace/answer_dump/{mode}/{filename}.csv'
+            summary_path = f'results_dump/{eval_dataset}/{args.exp}_{args.instruction_prompt}_supspace/summary_dump/{mode}/{filename}.csv'
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             os.makedirs(os.path.dirname(summary_path), exist_ok=True)
 
@@ -430,10 +430,12 @@ def main():
                 except:
                     pass
             
-            save_folder = f'{args.save_folder}/{args.exp}_eff_save/{args.train_dataset}/{args.model_name}_seed_{args.seed}_fold_{fold}_loss_type_{args.loss_type}_alpha_bl_{args.alpha_bl}'
+            save_folder = f'{args.save_folder}/{args.exp}_eff_save/{args.train_dataset}/{args.model_name}_seed_{args.seed}_fold_{fold}_loss_type_{args.loss_type}_kappa_{args.kappa}_lora_rank_{args.lora_rank}'
             used_activations = [separated_head_wise_activations[i] for i in train_set_idxs]
             used_labels = [separated_labels[i] for i in train_set_idxs]
-            interventions = get_eff_interventions_dict(top_heads, used_activations, used_labels, save_folder, lora_rank=args.lora_rank, alpha=args.alpha_bl, recal=args.recal)
+            val_activations = [separated_head_wise_activations[i] for i in val_set_idxs]
+            val_labels = [separated_labels[i] for i in val_set_idxs]
+            interventions = get_linear_span_interventions_dict(top_heads, used_activations, used_labels, val_activations, val_labels, save_folder, lora_rank=args.lora_rank, recal=args.recal, kappa=args.kappa)
             
 
             def lt_modulated_vector_add(head_output, layer_name, start_edit_location='lt'): 

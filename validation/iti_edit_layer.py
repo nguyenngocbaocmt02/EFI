@@ -255,9 +255,13 @@ def main():
                 for head, direction, proj_val_std in interventions[layer_name]:
                     direction_to_add = torch.tensor(direction).to(head_output.device.index)
                     if start_edit_location == 'lt': 
-                        head_output[:, -1, head, :] += args.alpha * proj_val_std * direction_to_add
+                        tmp = args.alpha * proj_val_std * direction_to_add
+                        print(torch.norm(tmp))
+                        head_output[:, -1, head, :] += tmp
                     else: 
-                        head_output[:, start_edit_location:, head, :] += args.alpha * proj_val_std * direction_to_add
+                        tmp = args.alpha * proj_val_std * direction_to_add
+                        print(torch.norm(tmp))
+                        head_output[:, start_edit_location:, head, :] += tmp
                 head_output = rearrange(head_output, 'b s h d -> b s (h d)')
                 return head_output
         if args.use_ot_intervention:
