@@ -416,7 +416,7 @@ def main():
 
 
             output_path = f'results_dump/{eval_dataset}/{args.exp}_{args.instruction_prompt}_subspace/answer_dump/{mode}/{filename}.csv'
-            summary_path = f'results_dump/{eval_dataset}/{args.exp}_{args.instruction_prompt}_supspace/summary_dump/{mode}/{filename}.csv'
+            summary_path = f'results_dump/{eval_dataset}/{args.exp}_{args.instruction_prompt}_subspace/summary_dump/{mode}/{filename}.csv'
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             os.makedirs(os.path.dirname(summary_path), exist_ok=True)
 

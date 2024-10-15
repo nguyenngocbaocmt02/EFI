@@ -15,16 +15,18 @@ CACHE="/home/users/nus/binhnt/scratch/.cache/huggingface/hub"
 # 'alpaca_7B', 'vicuna_7B', 'llama2_chat_13B', 'llama3_8B'
 # TEST
 for MODEL in llama_7B; do
-    for delta in 10.0; do
-        for alpha in 0.0; do
+    for delta in 30.0; do
+        for alpha in 0.2; do
             for lora_rank in 32; do
-                echo "model: $MODEL alpha_bl: $alpha lora_rank: $lora_rank delta: $delta"
-                CUDA_VISIBLE_DEVICES=2 python elipsoid_edit_layer.py --recal --delta $delta --alpha_bl $alpha --lora_rank $lora_rank --instruction_prompt default --exp_mode test --clf_only 0 --exp max_min_version --model_name $MODEL --device 0 --num_fold 2 --judge_name $JUDGE --info_name $INFO --eval_dataset $EVAL_DATASET --train_dataset $TRAIN_DATASET --save_folder $SAVE --cache_dir $CACHE --loss_type cross_entropy
-                echo
-                echo
+                for shrinking in 1.0; do
+                    echo "model: $MODEL alpha_bl: $alpha, lora_rank: $lora_rank, delta: $delta, sh $shrinking"
+                    CUDA_VISIBLE_DEVICES=3 python elipsoid_edit_layer.py --recal --shrinking $shrinking --delta $delta --alpha_bl $alpha --lora_rank $lora_rank --instruction_prompt default --exp_mode test --clf_only 0 --exp test2 --model_name $MODEL --device 0 --num_fold 2 --judge_name $JUDGE --info_name $INFO --eval_dataset $EVAL_DATASET --train_dataset $TRAIN_DATASET --save_folder $SAVE --cache_dir $CACHE --loss_type cross_entropy
+                    echo
+                    echo
+                done
             done
         done
     done
 done
 
-# python eff_edit_layer.py --recal --delta 100 --alpha_bl 0.891 --lora_rank 8 --instruction_prompt default --exp_mode test --clf_only 0 --exp test --model_name llama_7B --device 0 --num_fold 2 --judge_name ft:davinci-002:ethicalytics:truthful:A0WsrZ0l --info_name ft:davinci-002:ethicalytics:truthful:A0WsrZ0l --eval_dataset truthful_qa --train_dataset truthful_qa --save_folder /big_storage/baonn/eff --cache_dir /home/users/nus/binhnt/scratch/.cache/huggingface/hub --loss_type cross_entropy
+# python eff_edit_layer.py --recal --delta 100 --alpha_bl 0.0 --lora_rank 8 --instruction_prompt default --exp_mode test --clf_only 0 --exp test --model_name llama_7B --device 0 --num_fold 2 --judge_name ft:davinci-002:ethicalytics:truthful:A0WsrZ0l --info_name ft:davinci-002:ethicalytics:truthful:A0WsrZ0l --eval_dataset truthful_qa --train_dataset truthful_qa --save_folder /big_storage/baonn/eff --cache_dir /home/users/nus/binhnt/scratch/.cache/huggingface/hub --loss_type cross_entropy

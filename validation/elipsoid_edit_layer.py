@@ -18,6 +18,9 @@ from truthfulqa.utilities import (find_start, format_best, format_prompt,
                                   format_prompt_with_answer_strings,
                                   split_multi_answer)
 import sys
+from sklearn.metrics import (accuracy_score, f1_score, precision_score,
+                             recall_score)
+from sklearn.linear_model import LogisticRegression
 from torch.nn.functional import tanh
 sys.path.append('../')
 from lofit_models.modeling_llama import LlamaModel,LlamaForCausalLM
@@ -108,38 +111,6 @@ def load_attention_components(model, path_A, path_v):
         for j, module in enumerate(attn_v):
             module.data.copy_(attn_v_params[f'layer_{i}'][f'head_{j}'])
 
-class LogisticRegression(nn.Module):
-    def __init__(self, input_size):
-        super(LogisticRegression, self).__init__()
-        self.linear = nn.Linear(input_size, 1)
-        self.sigmoid = nn.Sigmoid()
-        nn.init.xavier_uniform_(self.linear.weight)
-        nn.init.constant_(self.linear.bias, 0.0)
-
-    def forward(self, x):
-        x = self.linear(x)
-        x = self.sigmoid(x)
-        return x
-    
-def smooth_fpr_fnr_loss(y_pred, y_true, bl):
-    FP = torch.sum(y_pred * (1 - y_true)) 
-    FN = torch.sum((1 - y_pred) * y_true)
-    return FP / torch.sum(y_true == 0) + bl * FN / torch.sum(y_true == 1)
-
-def fpr_fnr_loss(y_pred, y_true, bl):
-    FPR = torch.sum((y_pred == 1) & (y_true == 0)).item() / torch.sum(y_true == 0)
-    FNR = torch.sum((y_pred == 0) & (y_true == 1)).item() / torch.sum(y_true == 1)
-    return FPR + bl * FNR
-
-def l2_loss(y_pred, y_true):
-    return torch.sum((y_pred - y_true) ** 2)
-
-def cross_entropy_loss(y_pred, y_true):
-    return F.cross_entropy(y_pred, y_true)
-
-def kl_divergence_loss(y_pred, y_true):
-    y_pred = F.log_softmax(y_pred, dim=-1)
-    return F.kl_div(y_pred, y_true, reduction='batchmean')
 
 def main(): 
     parser = argparse.ArgumentParser()
@@ -159,12 +130,13 @@ def main():
     parser.add_argument('--instruction_prompt', default="default",type=str, required=False)
     parser.add_argument('--save_folder', default="./clf",type=str, required=False)
     parser.add_argument('--clf_only', default=0,type=int)
-    parser.add_argument('--layer_sweep', default=2,type=int)
+    parser.add_argument('--layer_sweep', default=1,type=int)
     parser.add_argument('--exp_mode', type=str, default='test', help='val or test')
     parser.add_argument('--prompting', default=0,type=int)
     parser.add_argument('--lora_rank', default=4, type=int)
     parser.add_argument('--alpha_bl', type=float, default=0.9, help='alpha for iti')
     parser.add_argument('--delta', type=float, default=1.0, help='alpha for iti')
+    parser.add_argument('--shrinking', type=float, default=1.0, help='alpha for iti')
     parser.add_argument('--recal', action='store_true', help='use iti to select intervened heads', default=False)
 
     parser.add_argument('--use_iti', action='store_true', help='use iti to select intervened heads', default=False)
@@ -239,21 +211,6 @@ def main():
 
     separated_head_wise_activations, separated_labels, idxs_to_split_at = get_separated_activations(labels, head_wise_activations)
 
-    if args.loss_type == "fpr_fnr":
-        loss_func = lambda y_pred, y_true: smooth_fpr_fnr_loss(y_pred, y_true, bl=args.bl)
-        rloss_func = lambda y_pred, y_true: fpr_fnr_loss(y_pred, y_true, bl=args.bl)
-    elif args.loss_type == "l2":
-        loss_func = l2_loss
-        rloss_func = l2_loss
-    elif args.loss_type == "cross_entropy":
-        loss_func = cross_entropy_loss
-        rloss_func = cross_entropy_loss
-    elif args.loss_type == "kl_divergence":
-        loss_func = kl_divergence_loss
-        rloss_func = kl_divergence_loss
-    else:
-        raise ValueError(f"Unknown loss type: {args.loss_type}")
-
     results = []
     # run k-fold cross validation
     for fold in range(args.num_fold):
@@ -276,96 +233,25 @@ def main():
 
         all_X_train = np.concatenate([separated_head_wise_activations[i] for i in train_set_idxs], axis = 0)
         all_X_val = np.concatenate([separated_head_wise_activations[i] for i in val_set_idxs], axis = 0)
-        y_train = 1 - np.concatenate([separated_labels[i] for i in train_set_idxs], axis = 0)
-        y_val = 1 - np.concatenate([separated_labels[i] for i in val_set_idxs], axis = 0)
+        y_train = np.concatenate([separated_labels[i] for i in train_set_idxs], axis = 0)
+        y_val = np.concatenate([separated_labels[i] for i in val_set_idxs], axis = 0)
 
-        probes = []
-        
-        val_loss_logs = []
-        vote_logs = []
+        acc_layer_list = []
+        for layer in tqdm(range(num_layers), desc="train_probes"): 
+            acc_layer = 0
+            for head in range(num_heads): 
+                X_train = all_X_train[:,layer,head,:]
+                X_val = all_X_val[:,layer,head,:]
 
-        # for layer_idx in range(num_layers):
-        #     val_votes = []
-        #     accs = []
-        #     for head_idx in range(num_heads):
-        #         save_path_clf = f"{args.save_folder}/{args.exp}_eff_save/{args.train_dataset}/seed_{args.seed}_fold_{fold}_{args.model_name}_dataset_{args.dataset_name}_loss_type_{args.loss_type}_bl_{args.bl}_layer_{layer_idx}_head_{head_idx}.pth"
-            
-        #         X_train = all_X_train[:,layer_idx,head_idx,:]
-        #         X_val = all_X_val[:,layer_idx,head_idx,:]
-        #         X_train = X_train.reshape(X_train.shape[0], -1)
-        #         X_val = X_val.reshape(X_val.shape[0], -1)
+                clf = LogisticRegression(random_state=args.seed, max_iter=1000).fit(X_train, y_train)
+                y_pred = clf.predict(X_train)
+                y_val_pred = clf.predict(X_val)
+                acc_layer += accuracy_score(y_val, y_val_pred) 
+            acc_layer /= num_heads
+            acc_layer_list.append(acc_layer)
 
-        #         X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
-        #         y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
-        #         X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
-        #         y_val_tensor = torch.tensor(y_val, dtype=torch.float32)
+        target_layers = np.argsort(acc_layer_list)[-args.layer_sweep:]
 
-        #         clf = LogisticRegression(input_size=X_train.shape[1])
-        #         optimizer = optim.Adam(clf.parameters(), lr=2e-3)
-        #         best_loss = float("inf")
-        #         best_model_state = None
-
-        #         try:
-        #             clf.load_state_dict(torch.load(save_path_clf))
-        #         except:
-        #             if os.path.exists(save_path_clf):
-        #                 os.remove(save_path_clf)
-        #             for epoch in range(1000):
-        #                 clf.train()
-        #                 optimizer.zero_grad()
-        #                 outputs = clf(X_train_tensor)
-        #                 loss = loss_func(outputs.squeeze(), y_train_tensor)
-        #                 loss.backward()
-        #                 optimizer.step()
-
-        #                 with torch.no_grad():
-        #                     clf.eval()
-        #                     val_outputs = clf(X_val_tensor)
-        #                     predicted_labels = (val_outputs.squeeze() > 0.5).float()
-        #                     val_loss = rloss_func(predicted_labels, y_val_tensor)
-        #                     if val_loss < best_loss:
-        #                         best_loss = val_loss
-        #                         best_model_state = clf.state_dict()
-        #             if best_model_state is not None:
-        #                 clf.load_state_dict(best_model_state)
-        #             if not os.path.exists(os.path.dirname(save_path_clf)):
-        #                 os.makedirs(os.path.dirname(save_path_clf))
-        #             torch.save(clf.state_dict(), save_path_clf)
-        #         clf.eval()
-        #         probes.append(clf)
-        #         val_outputs = clf(X_val_tensor)
-        #         predicted_labels = (val_outputs.squeeze() > 0.5).float()
-        #         val_votes.append((val_outputs.squeeze() > 0.5).float())
-        #         accs.append(rloss_func(predicted_labels, y_val_tensor))
-        #     no_votes = len(val_votes)
-        #     best_th = 16
-        #     best_FNR = float("inf")
-        #     best_loss = float("inf")
-        #     for threshold in range(0, int(no_votes)):
-        #         predicted_labels = (torch.mean(torch.stack(val_votes), axis=0).squeeze() >= threshold * 1.0 / no_votes).float()
-        #         val_loss = rloss_func(predicted_labels, y_val_tensor)
-        #         FNR = torch.sum((predicted_labels == 0) & (y_val_tensor == 1)).item() / torch.sum(y_val_tensor == 1)
-        #         if FNR < best_FNR or (best_FNR == FNR and val_loss < best_loss):
-        #             best_th = threshold
-        #             best_loss = val_loss
-        #             best_FNR = FNR
-        #     predicted_labels = (torch.mean(torch.stack(val_votes), axis=0).squeeze() >= best_th * 1.0 / no_votes).float()
-        #     accuracy = torch.sum((predicted_labels == y_val_tensor)).item() / len(y_val_tensor)
-        #     TP = torch.sum((predicted_labels == 1) & (y_val_tensor == 1)).item() 
-        #     TN = torch.sum((predicted_labels == 0) & (y_val_tensor == 0)).item()
-        #     FP = torch.sum((predicted_labels == 1) & (y_val_tensor == 0)).item() 
-        #     FN = torch.sum((predicted_labels == 0) & (y_val_tensor == 1)).item()
-        #     FPR = torch.sum((predicted_labels == 1) & (y_val_tensor == 0)).item() / torch.sum(y_val_tensor == 0)
-        #     FNR = torch.sum((predicted_labels == 0) & (y_val_tensor == 1)).item() / torch.sum(y_val_tensor == 1)
-        #     val_loss =  rloss_func(predicted_labels, y_val_tensor)
-        #     val_loss_logs.append(np.mean(accs))
-        #     vote_logs.append(best_th)
-        #     F1 = 2 * TP / (2 * TP + FN + FP)
-        #     print(f"Layer {layer_idx}: Threshold: {best_th},Acc:{accuracy}, F1={F1}, FPR: {FPR}, FNR: {FNR}, VAL_LOSS: {val_loss}, ACCS: {max(accs)}, {min(accs)}, {sum(accs) / len(accs)}")
-        
-        # target_layers = np.argsort(val_loss_logs)[:args.layer_sweep]
-
-        target_layers = [11]
         print("Target: ", target_layers)
         ite = -1
         val_score = []
@@ -394,11 +280,8 @@ def main():
             top_heads = []
             for head in range(num_heads):
                 top_heads.append((target_layer, head))
-            if args.clf_only == 1:
-                continue
-            
         
-            filename = f'{args.model_name}_train_{args.train_dataset}_seed_{args.seed}_fold_{fold}_lt_{args.loss_type}_alpha_bl_{args.alpha_bl}_lora_rank_{args.lora_rank}_delta_{args.delta}_layer_{target_layer}'
+            filename = f'{args.model_name}_train_{args.train_dataset}_seed_{args.seed}_fold_{fold}_lt_{args.loss_type}_alpha_bl_{args.alpha_bl}_lora_rank_{args.lora_rank}_delta_{args.delta}_layer_{target_layer}_sh_{args.shrinking}'
             
             if args.train_dataset == eval_dataset:
                 test_file = f'splits/{args.train_dataset}/fold_{fold}_{mode}_seed_{args.seed}.csv'
@@ -431,33 +314,35 @@ def main():
                 except:
                     pass
             
-            save_folder = f'{args.save_folder}/{args.exp}_eff_save/{args.train_dataset}/{args.model_name}_seed_{args.seed}_fold_{fold}_loss_type_{args.loss_type}_alpha_bl_{args.alpha_bl}_delta_{args.delta}_lora_rank_{args.lora_rank}'
+            save_folder = f'{args.save_folder}/{args.exp}_eff_save/{args.train_dataset}/{args.model_name}_seed_{args.seed}_fold_{fold}_loss_type_{args.loss_type}_alpha_bl_{args.alpha_bl}_delta_{args.delta}_lora_rank_{args.lora_rank}_sh_{args.shrinking}'
             used_activations = [separated_head_wise_activations[i] for i in train_set_idxs]
             used_labels = [separated_labels[i] for i in train_set_idxs]
             val_activations = [separated_head_wise_activations[i] for i in val_set_idxs]
             val_labels = [separated_labels[i] for i in val_set_idxs]
-            interventions = get_elipsoid_interventions_dict(top_heads, used_activations, used_labels, val_activations, val_labels, save_folder, lora_rank=args.lora_rank, alpha=args.alpha_bl, recal=args.recal, delta=args.delta)
+            interventions = get_elipsoid_interventions_dict(top_heads, used_activations, used_labels, val_activations, val_labels, save_folder, lora_rank=args.lora_rank, alpha=args.alpha_bl, recal=args.recal, delta=args.delta, shrinking=args.shrinking)
             
 
             def lt_modulated_vector_add(head_output, layer_name, start_edit_location='lt'): 
                 head_output = rearrange(head_output, 'b s (h d) -> b s h d', h=num_heads)
                 threshold = None
                 if start_edit_location == 'lt': 
-                    for i, (head, W, b, R) in enumerate(interventions[layer_name]):
+                    for i, (head, W, b, R, c) in enumerate(interventions[layer_name]):
                         W = W.to(head_output.device.index).to(head_output.dtype)
                         b = b.to(head_output.device.index).to(head_output.dtype)
                         R = R.to(head_output.device.index).to(head_output.dtype)
+                        c = c.to(head_output.device.index).to(head_output.dtype)
                         inputs = head_output[:, -1, head, :]
-                        head_output[:, -1, head, :] = (torch.tanh(W.unsqueeze(0).repeat(inputs.shape[0], 1, 1) * inputs.unsqueeze(-1).repeat(1, 1, args.lora_rank) + b) @ R.T @ inputs.unsqueeze(-1)).squeeze()
+                        head_output[:, -1, head, :] = (torch.tanh(W.unsqueeze(0).repeat(inputs.shape[0], 1, 1) * inputs.unsqueeze(-1).repeat(1, 1, args.lora_rank) + b) @ R.T @ inputs.unsqueeze(-1)).squeeze() + c.repeat(inputs.shape[0], 1)
 
                 else:
                     for loc in range(start_edit_location, head_output.shape[1]):
-                        for i, (head, W, b, R) in enumerate(interventions[layer_name]):
+                        for i, (head, W, b, R, c) in enumerate(interventions[layer_name]):
                             W = W.to(head_output.device.index).to(head_output.dtype)
                             b = b.to(head_output.device.index).to(head_output.dtype)
                             R = R.to(head_output.device.index).to(head_output.dtype)
+                            c = c.to(head_output.device.index).to(head_output.dtype)
                             inputs = head_output[:, -1, head, :]
-                            head_output[:, loc, head, :] = (torch.tanh(W.unsqueeze(0).repeat(inputs.shape[0], 1, 1) * inputs.unsqueeze(-1).repeat(1, 1, args.lora_rank) + b) @ R.T @ inputs.unsqueeze(-1)).squeeze()
+                            head_output[:, loc, head, :] = (torch.tanh(W.unsqueeze(0).repeat(inputs.shape[0], 1, 1) * inputs.unsqueeze(-1).repeat(1, 1, args.lora_rank) + b) @ R.T @ inputs.unsqueeze(-1)).squeeze() + c.repeat(inputs.shape[0], 1)
     
                 head_output = rearrange(head_output, 'b s h d -> b s (h d)')
                 return head_output
@@ -504,6 +389,5 @@ def main():
                 curr_fold_results = curr_fold_results.to_numpy()[0].astype(float)
                 break
         break
-
 if __name__ == "__main__":
     main()
