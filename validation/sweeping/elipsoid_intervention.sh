@@ -6,8 +6,8 @@ INFO=ft:davinci-002:ethicalytics:informative:A0WuCDTp
 LOG_FILE="sweep_output.log"
 EVAL_DATASET="truthful_qa"
 TRAIN_DATASET="truthful_qa"
-SAVE="/big_storage/baonn/eff"
-CACHE="/home/users/nus/binhnt/scratch/.cache/huggingface/hub"
+SAVE=""
+CACHE=""
 ##################################################
 #################   Ours   #######################
 ##################################################  
@@ -28,5 +28,3 @@ for MODEL in llama_7B; do
         done
     done
 done
-
-# python eff_edit_layer.py --recal --delta 100 --alpha_bl 0.0 --lora_rank 8 --instruction_prompt default --exp_mode test --clf_only 0 --exp test --model_name llama_7B --device 0 --num_fold 2 --judge_name ft:davinci-002:ethicalytics:truthful:A0WsrZ0l --info_name ft:davinci-002:ethicalytics:truthful:A0WsrZ0l --eval_dataset truthful_qa --train_dataset truthful_qa --save_folder /big_storage/baonn/eff --cache_dir /home/users/nus/binhnt/scratch/.cache/huggingface/hub --loss_type cross_entropy
